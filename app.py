@@ -1,19 +1,23 @@
 import gradio as gr
-import subprocess
-import time
-import requests
 import json
 import threading
 from datetime import datetime
 import os
+from typing import Dict, Any
 
-# Start FastAPI server in background
-def start_fastapi():
-    subprocess.Popen(["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"])
+# Import your model functions directly instead of making HTTP calls
+from model import (
+    load_or_train_model,
+    predict_user_input,
+    retrain_model_with_feedback,
+    store_predictions,
+    fetch_feedback_for_user,
+)
 
-# Start the server
-start_fastapi()
-time.sleep(5)  # Wait for server to start
+# Load model once at startup
+print("Loading model...")
+model = load_or_train_model()
+print("Model loaded successfully!")
 
 def predict_consumption(adult_male, adult_female, child, region, season, event, stocks_text):
     try:
@@ -24,7 +28,7 @@ def predict_consumption(adult_male, adult_female, child, region, season, event, 
                 product, amount = item.strip().split(':')
                 stocks[product.strip()] = float(amount.strip())
         
-        # Prepare the request
+        # Prepare the input (same structure as before)
         user_input = {
             "family": {
                 "adult_male": int(adult_male),
@@ -38,23 +42,23 @@ def predict_consumption(adult_male, adult_female, child, region, season, event, 
             "user_id": f"user_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         }
         
-        # Make request to FastAPI backend
-        response = requests.post("http://localhost:8000/predict", json=user_input, timeout=30)
+        # Call the prediction function directly instead of making HTTP request
+        results = predict_user_input(user_input, model)
         
-        if response.status_code == 200:
-            results = response.json()
-            formatted_results = []
-            for product, prediction in results.items():
-                formatted_results.append(f"""
+        # Store predictions (same as before)
+        store_predictions(user_input["user_id"], results, user_input)
+        
+        # Format results for display
+        formatted_results = []
+        for product, prediction in results.items():
+            formatted_results.append(f"""
 🥘 **{product.upper()}:**
 📊 Daily Consumption: {prediction['predicted_consumption']} kg
 ⏰ Will finish in: {prediction['predicted_finish_days']} days
 📅 Finish Date: {prediction['predicted_finish_date']}
 ⚠️ Prediction Error: ±{prediction['predicted_finish_error']} days
 """)
-            return "\n".join(formatted_results)
-        else:
-            return f"❌ Error: {response.status_code} - {response.text}"
+        return "\n".join(formatted_results)
     
     except Exception as e:
         return f"❌ Error: {str(e)}\n\nMake sure to format stocks as: rice:5, milk:3, potato:2"
