@@ -10,8 +10,7 @@ from sklearn.preprocessing import LabelEncoder, MinMaxScaler
 import tensorflow as tf
 from tensorflow.keras.models import Model, load_model
 from tensorflow.keras.layers import Input, LSTM, Dense
-
-
+import uuid
 
 # ===============================
 # 3. CONSTANTS & ENCODING
@@ -100,16 +99,54 @@ def generate_and_append_new_product(product, csv_path="initial_data.csv"):
     combined.to_csv(csv_path, index=False)
     print(f"Product '{product}' added to dataset.")
 
+def create_user_if_not_exists(user_id, user_name="test_user", email="test@example.com"):
+    """Create a user if they don't exist in the database"""
+    try:
+        # Check if user exists
+        response = supabase.table("users").select("user_id").eq("user_id", user_id).execute()
+        if response.data:
+            print(f"User {user_id} already exists")
+            return True
+        
+        # Create new user
+        new_user = {
+            "user_id": user_id,
+            "user_name": user_name,
+            "email": email,
+            "region": "urban",  # default values
+            "adult_male": 1,
+            "adult_female": 1,
+            "child": 0
+        }
+        
+        response = supabase.table("users").insert(new_user).execute()
+        print(f"Created new user: {user_id}")
+        return True
+        
+    except Exception as e:
+        print(f"Error creating user: {e}")
+        return False
+
 def fetch_feedback_for_user(user_id):
     response = supabase.table("feedback_data").select("*").eq("user_id", user_id).execute()
     return pd.DataFrame(response.data) if response.data else pd.DataFrame()
 
 def insert_feedback(user_id, df):
+    # Ensure user exists before inserting feedback
+    if not create_user_if_not_exists(user_id):
+        print("Failed to create user, cannot insert feedback")
+        return
+    
     df['user_id'] = user_id
     response = supabase.table("feedback_data").insert(df.to_dict(orient="records")).execute()
-    print(response)
+    print("Feedback inserted successfully")
 
 def store_predictions(user_id, predictions, user_input):
+    # Ensure user exists before storing predictions
+    if not create_user_if_not_exists(user_id):
+        print("Failed to create user, cannot store predictions")
+        return
+    
     rows = []
     for product, result in predictions.items():
         row = {
@@ -129,7 +166,7 @@ def store_predictions(user_id, predictions, user_input):
         }
         rows.append(row)
     res = supabase.table("prediction_data").insert(rows).execute()
-    print("Predictions stored:", res.status_code)
+    print("Predictions stored successfully")
 
 # ===============================
 # 5. MODELING
@@ -269,32 +306,39 @@ def predict_user_input(user_input, model):
 # ===============================
 # 7. EXAMPLE RUN
 # ===============================
-model = load_or_train_model()
+if __name__ == "__main__":
+    model = load_or_train_model()
 
-user_input = {
-    "family": {"adult_male": 2, "adult_female": 2, "child": 1},
-    "region": "urban",
-    "season": "summer",
-    "event": "normal",
-    "stock": {"rice": 5, "milk": 3, "chicken": 4}  # 'chicken' is new
-}
+    user_input = {
+        "family": {"adult_male": 2, "adult_female": 2, "child": 1},
+        "region": "urban",
+        "season": "summer",
+        "event": "normal",
+        "stock": {"rice": 5, "milk": 3, "chicken": 4}  # 'chicken' is new
+    }
 
-results = predict_user_input(user_input, model)
-print(pd.DataFrame(results).T)
+    results = predict_user_input(user_input, model)
+    print(pd.DataFrame(results).T)
 
-feedback = pd.DataFrame([{
-    'date': datetime.today().strftime('%Y-%m-%d'),
-    'product': k,
-    'region': user_input['region'],
-    'season': user_input['season'],
-    'event': user_input['event'],
-    'adult_male': user_input['family']['adult_male'],
-    'adult_female': user_input['family']['adult_female'],
-    'child': user_input['family']['child'],
-    'consumption': v['predicted_consumption'],
-    'finish_error': v['predicted_finish_error'],
-    'finish_days': v['predicted_finish_days']
-} for k, v in results.items()])
+    feedback = pd.DataFrame([{
+        'date': datetime.today().strftime('%Y-%m-%d'),
+        'product': k,
+        'region': user_input['region'],
+        'season': user_input['season'],
+        'event': user_input['event'],
+        'adult_male': user_input['family']['adult_male'],
+        'adult_female': user_input['family']['adult_female'],
+        'child': user_input['family']['child'],
+        'consumption': v['predicted_consumption'],
+        'finish_error': v['predicted_finish_error'],
+        'finish_days': v['predicted_finish_days']
+    } for k, v in results.items()])
+    
+    user_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, "user001"))
 
-insert_feedback("user001", feedback)
-store_predictions("user001", results, user_input)
+    try:
+        insert_feedback(user_uuid, feedback)
+        store_predictions(user_uuid, results, user_input)
+        print("Data insertion completed successfully!")
+    except Exception as e:
+        print(f"Error during data insertion: {e}")
