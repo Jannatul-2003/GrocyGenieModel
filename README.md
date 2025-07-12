@@ -88,3 +88,8 @@ This project is licensed under the Apache License 2.0 - see the LICENSE file for
 
 For more information about Hugging Face Spaces configuration, check out the [configuration reference](https://huggingface.co/docs/hub/spaces-config-reference).
 
+[![Hugging Face Spaces](https://img.shields.io/badge/🤗%20View%20on-Hugging%20Face-blue)](https://huggingface.co/spaces/Jannatul03/grocy-genie-lstm)
+
+## FastAPI
+
+**https://jannatul03-grocy-genie-grocy-genie-lstm.hf.space/docs**
