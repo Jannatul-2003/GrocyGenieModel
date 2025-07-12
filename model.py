@@ -11,10 +11,26 @@ import tensorflow as tf
 from tensorflow.keras.models import Model, load_model
 from tensorflow.keras.layers import Input, LSTM, Dense
 import uuid
+import joblib
+from pathlib import Path
+
+
 
 # ===============================
 # 3. CONSTANTS & ENCODING
 # ===============================
+
+
+MODEL_PATH = "/tmp/global_model.h5"
+DATA_PATH = "/tmp/initial_data.csv"
+SCALER_PATH = "/tmp/scaler.pkl"
+
+
+
+
+
+
+
 REGIONS = ['urban', 'rural']
 SEASONS = ['winter', 'spring', 'summer', 'autumn']
 EVENTS = ['normal', 'fasting', 'guests', 'sickness', 'travel', 'meal_off']
@@ -88,7 +104,7 @@ def generate_data(products, families=3, days=180):
 def is_new_product(product, existing_df):
     return product not in existing_df['product'].unique()
 
-def generate_and_append_new_product(product, csv_path="initial_data.csv"):
+def generate_and_append_new_product(product, csv_path=DATA_PATH):
     print(f"Generating synthetic data for new product: {product}")
     new_df = generate_data([product], families=3, days=180)
     if os.path.exists(csv_path):
@@ -98,6 +114,7 @@ def generate_and_append_new_product(product, csv_path="initial_data.csv"):
         combined = new_df
     combined.to_csv(csv_path, index=False)
     print(f"Product '{product}' added to dataset.")
+
 
 def create_user_if_not_exists(user_id, user_name="test_user", email="test@example.com"):
     """Create a user if they don't exist in the database"""
@@ -127,6 +144,7 @@ def create_user_if_not_exists(user_id, user_name="test_user", email="test@exampl
         print(f"Error creating user: {e}")
         return False
 
+
 def fetch_feedback_for_user(user_id):
     response = supabase.table("feedback_data").select("*").eq("user_id", user_id).execute()
     return pd.DataFrame(response.data) if response.data else pd.DataFrame()
@@ -141,36 +159,51 @@ def insert_feedback(user_id, df):
     response = supabase.table("feedback_data").insert(df.to_dict(orient="records")).execute()
     print("Feedback inserted successfully")
 
-def store_predictions(user_id, predictions, user_input):
-    # Ensure user exists before storing predictions
-    if not create_user_if_not_exists(user_id):
-        print("Failed to create user, cannot store predictions")
-        return
+
+
+def get_product_id(product_name):
+    res = supabase.table("products").select("product_id").eq("product_name", product_name).execute()
+    if res.data:
+        return res.data[0]['product_id']
     
+    # Optionally, insert the product if it doesn't exist
+    new_id = str(uuid.uuid4())
+    supabase.table("products").insert({
+        'product_id': new_id,
+        'product_name': product_name,
+        'unit': 'unit'  # Replace with logic if needed
+    }).execute()
+    return new_id
+
+
+
+def store_predictions(user_id, predictions, user_input):
     rows = []
     for product, result in predictions.items():
+        product_id = get_product_id(product)  # Supabase lookup
         row = {
             'user_id': user_id,
-            'date': datetime.today().strftime('%Y-%m-%d'),
-            'product': product,
-            'region': user_input['region'],
-            'season': user_input['season'],
-            'event': user_input['event'],
-            'adult_male': user_input['family']['adult_male'],
-            'adult_female': user_input['family']['adult_female'],
-            'child': user_input['family']['child'],
+            'product_id': product_id,
+            'prediction_date': datetime.today().date().isoformat(),
             'predicted_consumption': result['predicted_consumption'],
             'predicted_finish_days': result['predicted_finish_days'],
             'predicted_finish_date': result['predicted_finish_date'],
-            'predicted_finish_error': result['predicted_finish_error']
+            'predicted_error': result['predicted_finish_error'],
+            'stock_quantity': user_input['stock'][product],
         }
         rows.append(row)
-    res = supabase.table("prediction_data").insert(rows).execute()
-    print("Predictions stored successfully")
+
+    supabase.table("prediction_outputs").insert(rows).execute()
+    print("✅ Predictions stored successfully")
+
+
+
 
 # ===============================
 # 5. MODELING
 # ===============================
+
+
 def prepare_data(df, products):
     global le_product, scaler
     le_product = LabelEncoder().fit(products)
@@ -178,31 +211,38 @@ def prepare_data(df, products):
     df['season_enc'] = le_season.transform(df['season'])
     df['event_enc'] = le_event.transform(df['event'])
     df['product_enc'] = le_product.transform(df['product'])
+
     df['date'] = pd.to_datetime(df['date'])
     df = df.sort_values('date')
+
     if scaler is None:
         scaler_local = MinMaxScaler()
         df[['adult_male','adult_female','child','consumption']] = scaler_local.fit_transform(df[['adult_male','adult_female','child','consumption']])
     else:
         scaler_local = scaler
         df[['adult_male','adult_female','child','consumption']] = scaler_local.transform(df[['adult_male','adult_female','child','consumption']])
+
     X, y1, y2, y3 = [], [], [], []
     seq_len = 7
     for p in df['product_enc'].unique():
-        sub = df[df['product_enc']==p].reset_index(drop=True)
-        feats = sub[['adult_male','adult_female','child','region_enc','season_enc','event_enc']].values
+        sub = df[df['product_enc'] == p].reset_index(drop=True)
+        feats = sub[['adult_male','adult_female','child','region_enc','season_enc','event_enc','product_enc']].values
         c = sub['consumption'].values
         err = sub['finish_error'].values
         days = sub['finish_days'].values
-        for i in range(len(sub)-seq_len):
-            X.append(feats[i:i+seq_len])
-            y1.append(c[i+seq_len])
-            y2.append(err[i+seq_len])
-            y3.append(days[i+seq_len])
+        for i in range(len(sub) - seq_len):
+            X.append(feats[i:i + seq_len])
+            y1.append(c[i + seq_len])
+            y2.append(err[i + seq_len])
+            y3.append(days[i + seq_len])
     return np.array(X), np.array(y1), np.array(y2), np.array(y3), scaler_local
 
+
+
+
+
 def build_model(input_shape):
-    inp = Input(shape=input_shape)
+    inp = Input(shape=input_shape)  # should be (7, 7)
     x = LSTM(64)(inp)
     x = Dense(32, activation='relu')(x)
     out1 = Dense(1, name='daily_consumption_output')(x)
@@ -212,36 +252,102 @@ def build_model(input_shape):
     model.compile(optimizer='adam', loss=tf.keras.losses.MeanSquaredError())
     return model
 
+
+
+
+'''
 def load_or_train_model():
     global scaler
-    if not os.path.exists("initial_data.csv"):
-        pd.DataFrame(columns=['date','product','region','season','event','adult_male','adult_female','child','consumption','finish_error','finish_days']).to_csv("initial_data.csv", index=False)
-    df = pd.read_csv("initial_data.csv")
+    model_path = MODEL_PATH
+
+    # Ensure initial dataset exists
+    if not os.path.exists(DATA_PATH):
+        pd.DataFrame(columns=['date','product','region','season','event','adult_male','adult_female','child','consumption','finish_error','finish_days']).to_csv(DATA_PATH, index=False)
+
+    df = pd.read_csv(DATA_PATH)
     if df.empty:
         df = generate_data(list(BASE_CONSUMPTION.keys()))
-        df.to_csv("initial_data.csv", index=False)
+        df.to_csv(DATA_PATH, index=False)
+
     products = df['product'].unique().tolist()
+    
+    # Prepare training data with product_enc included
     X, y1, y2, y3, scaler_obj = prepare_data(df, products)
     scaler = scaler_obj
-    model_path = "global_model.h5"
+
+    # Delete model if exists (in case it was trained on wrong shape earlier)
     if os.path.exists(model_path):
-        model = load_model(model_path)
-    else:
-        model = build_model((X.shape[1], X.shape[2]))
-        model.fit(
-            X,
-            {'daily_consumption_output': y1,
-             'finish_error_output': y2,
-             'finish_days_output': y3},
-            epochs=10,
-            batch_size=32,
-            validation_split=0.1,
-        )
-        model.save(model_path)
+        os.remove(model_path)
+
+    # Build and train model
+    model = build_model((X.shape[1], X.shape[2]))  # shape (7, 7)
+    model.fit(
+        X,
+        {'daily_consumption_output': y1,
+         'finish_error_output': y2,
+         'finish_days_output': y3},
+        epochs=10,
+        batch_size=32,
+        validation_split=0.1,
+    )
+    model.save(model_path)
+    print("Model trained and saved to:", model_path)
+
+    return model
+'''
+
+def load_or_train_model():
+    global scaler
+    model_path = MODEL_PATH
+
+    # Ensure initial dataset exists
+    if not os.path.exists(DATA_PATH):
+        pd.DataFrame(columns=[
+            'date', 'product', 'region', 'season', 'event',
+            'adult_male', 'adult_female', 'child',
+            'consumption', 'finish_error', 'finish_days'
+        ]).to_csv(DATA_PATH, index=False)
+
+    df = pd.read_csv(DATA_PATH)
+    if df.empty:
+        df = generate_data(list(BASE_CONSUMPTION.keys()))
+        df.to_csv(DATA_PATH, index=False)
+
+    products = df['product'].unique().tolist()
+
+    # Prepare data
+    X, y1, y2, y3, scaler_obj = prepare_data(df, products)
+    scaler = scaler_obj
+
+    # Clean old model if any
+    if os.path.exists(model_path):
+        os.remove(model_path)
+
+    # Train and save new model
+    model = build_model((X.shape[1], X.shape[2]))
+    model.fit(
+        X,
+        {
+            'daily_consumption_output': y1,
+            'finish_error_output': y2,
+            'finish_days_output': y3
+        },
+        epochs=10,
+        batch_size=32,
+        validation_split=0.1
+    )
+    model.save(model_path)
+    joblib.dump(scaler, SCALER_PATH)  # ✅ Save the fitted scaler
+
+    print("✅ Model trained and saved.")
+    print("✅ Scaler saved to scaler.pkl.")
+
     return model
 
+'''
+
 def retrain_model_with_feedback(user_id):
-    base_df = pd.read_csv("initial_data.csv")
+    base_df = pd.read_csv(DATA_PATH)
     feedback_df = fetch_feedback_for_user(user_id)
     if feedback_df.empty:
         print("No feedback found for user:", user_id)
@@ -258,22 +364,85 @@ def retrain_model_with_feedback(user_id):
         batch_size=32,
         validation_split=0.1,
     )
-    model.save("global_model.h5")
+    model.save(MODEL_PATH)
     print("Retrained model saved.")
+'''
+    
+'''
+def retrain_from_feedback(user_id: str):
+    """Retrains model using feedback for a specific user and updates saved model + scaler."""
+    base_df = pd.read_csv(DATA_PATH)
+    feedback_df = fetch_feedback_for_user(user_id)
+
+    if feedback_df.empty:
+        print(f"No feedback found for user {user_id}")
+        return False
+
+    combined_df = pd.concat([base_df, feedback_df], ignore_index=True)
+    products = combined_df['product'].unique().tolist()
+
+    X, y1, y2, y3, new_scaler = prepare_data(combined_df, products)
+    model = build_model((X.shape[1], X.shape[2]))
+
+    model.fit(
+        X,
+        {'daily_consumption_output': y1,
+         'finish_error_output': y2,
+         'finish_days_output': y3},
+        epochs=10,
+        batch_size=32,
+        validation_split=0.1,
+    )
+    model.save(MODEL_PATH)
+    joblib.dump(new_scaler,SCALER_PATH)
+    print(f"✅ Model retrained and saved for user {user_id}")
+    return True
+
+ '''
+def retrain_model_with_feedback(user_id):
+    base_df = pd.read_csv(DATA_PATH)
+    feedback_df = fetch_feedback_for_user(user_id)
+    if feedback_df.empty:
+        print("No feedback found for user:", user_id)
+        return {"message": f"No feedback found for user {user_id}"}
+    
+    combined_df = pd.concat([base_df, feedback_df], ignore_index=True)
+    X, y1, y2, y3, scaler_obj = prepare_data(combined_df, combined_df['product'].unique().tolist())
+    model = build_model((X.shape[1], X.shape[2]))
+    model.fit(
+        X,
+        {'daily_consumption_output': y1,
+         'finish_error_output': y2,
+         'finish_days_output': y3},
+        epochs=10,
+        batch_size=32,
+        validation_split=0.1,
+    )
+    model.save(MODEL_PATH)
+    print("Retrained model saved.")
+    return {"message": f"Retraining complete for user {user_id}"}
+
+
+
 
 # ===============================
 # 6. PREDICTION
 # ===============================
-def predict_user_input(user_input, model):
-    global le_product, scaler
-    initial_df = pd.read_csv("initial_data.csv")
+
+def predict_user_input(user_input):
+    global le_product, scaler, ml_model
+    initial_df = pd.read_csv(DATA_PATH)
     predictions = {}
+
     for product in user_input['stock'].keys():
         if is_new_product(product, initial_df):
             generate_and_append_new_product(product)
-            initial_df = pd.read_csv("initial_data.csv")
+            initial_df = pd.read_csv(DATA_PATH)
+
         products = initial_df['product'].unique().tolist()
         le_product = LabelEncoder().fit(products)
+        product_enc = le_product.transform([product])[0]
+
         vec = []
         for _ in range(7):
             base = calculate_base_consumption(user_input['family'], user_input['region'], user_input['season'], user_input['event'], product)
@@ -282,26 +451,51 @@ def predict_user_input(user_input, model):
                 user_input['family']['adult_female'],
                 user_input['family']['child']
             ]
-            df_input = pd.DataFrame([raw + [0]], columns=['adult_male', 'adult_female', 'child', 'consumption'])
+            df_input = pd.DataFrame([raw + [base]], columns=['adult_male', 'adult_female', 'child', 'consumption'])
             raw_scaled = scaler.transform(df_input)[0][:3]
             region_enc = le_region.transform([user_input['region']])[0]
             season_enc = le_season.transform([user_input['season']])[0]
             event_enc = le_event.transform([user_input['event']])[0]
-            features = list(raw_scaled) + [region_enc, season_enc, event_enc]
+
+            features = list(raw_scaled) + [region_enc, season_enc, event_enc, product_enc]
             vec.append(features)
-        vec = np.array(vec)[np.newaxis, :, :]
-        y1, y2, y3 = model.predict(vec, verbose=0)
+
+        vec = np.array(vec)[np.newaxis, :, :]  # shape = (1, 7, 7)
+
+        y1, y2, y3 = ml_model.predict(vec, verbose=0)
         daily = float(y1[0][0])
         error = float(y2[0][0])
         days = float(y3[0][0])
         finish_date = datetime.today() + timedelta(days=days)
+
         predictions[product] = {
             'predicted_consumption': round(daily, 3),
             'predicted_finish_days': round(days, 2),
             'predicted_finish_date': finish_date.strftime('%Y-%m-%d'),
             'predicted_finish_error': round(error, 2)
         }
+
     return predictions
+
+
+
+
+# ===============================
+# 8. GLOBAL LOADING FOR FASTAPI
+# ===============================
+# Load model and encoders for FastAPI app
+if os.path.exists(MODEL_PATH):
+    ml_model = tf.keras.models.load_model(MODEL_PATH)
+    print("✅ Loaded trained model for prediction.")
+else:
+    ml_model = load_or_train_model()
+
+scaler = joblib.load(SCALER_PATH)
+print("✅ Loaded scaler.")
+
+
+
+
 
 # ===============================
 # 7. EXAMPLE RUN

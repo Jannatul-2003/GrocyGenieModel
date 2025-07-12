@@ -1,112 +1,107 @@
-import gradio as gr
-import json
-import threading
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel
+from typing import Dict
 from datetime import datetime
-import os
-from typing import Dict, Any
+import uuid
+import model  # your existing model.py
+import joblib
+import pandas as pd
+import tensorflow as tf  # Import TensorFlow here
+import asyncio
 
-# Import your model functions directly instead of making HTTP calls
-from model import (
-    load_or_train_model,
-    predict_user_input,
-    retrain_model_with_feedback,
-    store_predictions,
-    fetch_feedback_for_user,
-)
 
-# Load model once at startup
-print("Loading model...")
-model = load_or_train_model()
-print("Model loaded successfully!")
+app = FastAPI()
 
-def predict_consumption(adult_male, adult_female, child, region, season, event, stocks_text):
+# Load or train model at startup
+ml_model = model.load_or_train_model()
+SCALER_PATH = "/tmp/scaler.pkl"
+
+
+# -------------------------
+# Request & Response Schemas
+# -------------------------
+
+class FamilyInput(BaseModel):
+    adult_male: int
+    adult_female: int
+    child: int
+
+class UserInput(BaseModel):
+    user_id: str
+    region: str
+    season: str
+    event: str
+    family: FamilyInput
+    stock: Dict[str, float]  # product_name: quantity
+
+class RetrainRequest(BaseModel):
+    user_id: str
+
+
+# -------------------------
+# API Routes
+# -------------------------
+
+# Define request body schema
+class Item(BaseModel):
+    name: str
+    quantity: int
+
+
+
+@app.get("/")
+def read_root():
+    return {"message": "✅ GrocyGenie API is running."}
+
+
+
+@app.post("/testpost")
+def test_post(item: Item):
+    return {"message": f"Received item '{item.name}' with quantity {item.quantity}"}
+
+
+@app.post("/predict")
+def predict(input_data: UserInput):
     try:
-        # Parse the stocks - expecting format like: rice:5, milk:3, potato:2
-        stocks = {}
-        for item in stocks_text.split(','):
-            if ':' in item:
-                product, amount = item.strip().split(':')
-                stocks[product.strip()] = float(amount.strip())
-        
-        # Prepare the input (same structure as before)
-        user_input = {
-            "family": {
-                "adult_male": int(adult_male),
-                "adult_female": int(adult_female),
-                "child": int(child)
-            },
-            "region": region,
-            "season": season,
-            "event": event,
-            "stock": stocks,
-            "user_id": f"user_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        user_dict = input_data.dict()
+        user_id = user_dict["user_id"]
+
+        predictions = model.predict_user_input(user_dict)
+
+        model.store_predictions(user_id, predictions, user_dict)
+
+        feedback = pd.DataFrame([{
+            'date': datetime.today().strftime('%Y-%m-%d'),
+            'product': k,
+            'region': user_dict['region'],
+            'season': user_dict['season'],
+            'event': user_dict['event'],
+            'adult_male': user_dict['family']['adult_male'],
+            'adult_female': user_dict['family']['adult_female'],
+            'child': user_dict['family']['child'],
+            'consumption': v['predicted_consumption'],
+            'finish_error': v['predicted_finish_error'],
+            'finish_days': v['predicted_finish_days']
+        } for k, v in predictions.items()])
+
+        model.insert_feedback(user_id, feedback)
+
+        return {
+            "user_id": user_id,
+            "predictions": predictions
         }
-        
-        # Call the prediction function directly instead of making HTTP request
-        results = predict_user_input(user_input, model)
-        
-        # Store predictions (same as before)
-        store_predictions(user_input["user_id"], results, user_input)
-        
-        # Format results for display
-        formatted_results = []
-        for product, prediction in results.items():
-            formatted_results.append(f"""
-🥘 **{product.upper()}:**
-📊 Daily Consumption: {prediction['predicted_consumption']} kg
-⏰ Will finish in: {prediction['predicted_finish_days']} days
-📅 Finish Date: {prediction['predicted_finish_date']}
-⚠️ Prediction Error: ±{prediction['predicted_finish_error']} days
-""")
-        return "\n".join(formatted_results)
-    
+
     except Exception as e:
-        return f"❌ Error: {str(e)}\n\nMake sure to format stocks as: rice:5, milk:3, potato:2"
+        raise HTTPException(status_code=500, detail=str(e))
 
-# Create Gradio interface
-with gr.Blocks(theme=gr.themes.Soft(), title="🛒 Grocy Genie") as iface:
-    gr.Markdown("# 🛒 Grocy Genie - Smart Grocery Consumption Predictor")
-    gr.Markdown("Predict how long your groceries will last based on family size, region, season, and events.")
-    
-    with gr.Row():
-        with gr.Column():
-            gr.Markdown("### 👨‍👩‍👧‍👦 Family Information")
-            adult_male = gr.Number(label="Adult Males", value=2, minimum=0, maximum=10)
-            adult_female = gr.Number(label="Adult Females", value=2, minimum=0, maximum=10)
-            child = gr.Number(label="Children", value=1, minimum=0, maximum=10)
-            
-            gr.Markdown("### 🏠 Context Information")
-            region = gr.Dropdown(choices=["urban", "rural"], label="Region", value="urban")
-            season = gr.Dropdown(choices=["winter", "spring", "summer", "autumn"], label="Season", value="summer")
-            event = gr.Dropdown(choices=["normal", "fasting", "guests", "sickness", "travel", "meal_off"], label="Event", value="normal")
-            
-            gr.Markdown("### 🛍️ Current Stock")
-            stocks_text = gr.Textbox(
-                label="Stock (format: product:amount, product:amount)", 
-                value="rice:5, milk:3, potato:2",
-                placeholder="rice:5, milk:3, potato:2, onion:1",
-                lines=2
-            )
-        
-        with gr.Column():
-            gr.Markdown("### 📊 Predictions")
-            output = gr.Textbox(label="Results", lines=15, max_lines=20)
-            predict_btn = gr.Button("🔮 Predict Consumption", variant="primary", size="lg")
-    
-    predict_btn.click(
-        predict_consumption,
-        inputs=[adult_male, adult_female, child, region, season, event, stocks_text],
-        outputs=output
-    )
-    
-    gr.Markdown("### 📝 Example Usage")
-    gr.Markdown("""
-    - **Family**: 2 adult males, 2 adult females, 1 child
-    - **Context**: Urban area, summer season, normal event
-    - **Stock**: rice:5, milk:3, potato:2, onion:1
-    
-    The model will predict daily consumption and when each item will run out.
-    """)
 
-if __name__ == "__main__":
-    iface.launch(server_name="0.0.0.0", server_port=7860)
+@app.post("/retrain")
+def retrain_model(request: RetrainRequest):
+    success = model.retrain_model_with_feedback(request.user_id)
+    if success:
+        # Reload model and scaler globally for future predictions
+        model.ml_model = tf.keras.models.load_model(model.MODEL_PATH)
+        model.scaler = joblib.load(SCALER_PATH)
+        return {"message": f"Model retrained using feedback for user {request.user_id}."}
+    else:
+        raise HTTPException(status_code=404, detail="No feedback found for retraining.")
