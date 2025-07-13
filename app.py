@@ -1,21 +1,17 @@
-from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel
-from typing import Dict
-from datetime import datetime
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+from typing import Dict, Optional
+from datetime import datetime, date
 import uuid
 import model  # your existing model.py
 import joblib
-import pandas as pd
-import tensorflow as tf  # Import TensorFlow here
-import asyncio
-
+import tensorflow as tf
 
 app = FastAPI()
 
 # Load or train model at startup
 ml_model = model.load_or_train_model()
 SCALER_PATH = "/tmp/scaler.pkl"
-
 
 # -------------------------
 # Request & Response Schemas
@@ -26,82 +22,86 @@ class FamilyInput(BaseModel):
     adult_female: int
     child: int
 
-class UserInput(BaseModel):
+class StockAdditionInput(BaseModel):
+    """Schema for adding a new stock item and getting a prediction."""
     user_id: str
-    region: str
-    season: str
-    event: str
-    family: FamilyInput
-    stock: Dict[str, float]  # product_name: quantity
+    product_name: str
+    quantity: float = Field(..., gt=0) # Quantity must be greater than 0
+    purchase_date: date
+    # Optional context fields; if not provided, they can be fetched from the user's profile
+    region: Optional[str] = None
+    season: Optional[str] = None
+    event: Optional[str] = None
+    family: Optional[FamilyInput] = None
+
 
 class RetrainRequest(BaseModel):
     user_id: str
 
+class FeedbackInput(BaseModel):
+    stock_id: uuid.UUID
+    actual_finish_date: date
 
 # -------------------------
 # API Routes
 # -------------------------
-
-# Define request body schema
-class Item(BaseModel):
-    name: str
-    quantity: int
-
-
 
 @app.get("/")
 def read_root():
     return {"message": "✅ GrocyGenie API is running."}
 
 
-
-@app.post("/testpost")
-def test_post(item: Item):
-    return {"message": f"Received item '{item.name}' with quantity {item.quantity}"}
-
-
-@app.post("/predict")
-def predict(input_data: UserInput):
+@app.post("/stock/add")
+def add_stock_and_predict(input_data: StockAdditionInput):
+    """
+    Adds a new stock item for a user and predicts its depletion date.
+    This is the primary endpoint for making predictions.
+    """
     try:
-        user_dict = input_data.dict()
-        user_id = user_dict["user_id"]
-
-        predictions = model.predict_user_input(user_dict)
-
-        model.store_predictions(user_id, predictions, user_dict)
-
-        feedback = pd.DataFrame([{
-            'date': datetime.today().strftime('%Y-%m-%d'),
-            'product': k,
-            'region': user_dict['region'],
-            'season': user_dict['season'],
-            'event': user_dict['event'],
-            'adult_male': user_dict['family']['adult_male'],
-            'adult_female': user_dict['family']['adult_female'],
-            'child': user_dict['family']['child'],
-            'consumption': v['predicted_consumption'],
-            'finish_error': v['predicted_finish_error'],
-            'finish_days': v['predicted_finish_days']
-        } for k, v in predictions.items()])
-
-        model.insert_feedback(user_id, feedback)
+        # The model function now handles both prediction and DB insertion
+        result = model.predict_and_record_stock(input_data)
+        
+        if not result:
+            raise HTTPException(status_code=500, detail="Failed to create stock record or make prediction.")
 
         return {
-            "user_id": user_id,
-            "predictions": predictions
+            "message": "Stock added and prediction complete.",
+            "stock_id": result['stock_id'],
+            "product_name": input_data.product_name,
+            "predicted_finish_date": result['predicted_finish_date']
         }
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # import traceback
+        # traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
+
+
+@app.post("/feedback")
+def record_feedback(feedback_data: FeedbackInput):
+    """
+    Receives feedback from the user about the actual finish date of a stock item.
+    """
+    success = model.record_actual_finish_date(
+        feedback_data.stock_id,
+        feedback_data.actual_finish_date
+    )
+    if success:
+        return {"message": "Feedback recorded successfully."}
+    else:
+        raise HTTPException(status_code=404, detail=f"Stock ID {feedback_data.stock_id} not found or update failed.")
 
 
 @app.post("/retrain")
 def retrain_model(request: RetrainRequest):
-    success = model.retrain_model_with_feedback(request.user_id)
-    if success:
+    """
+    Triggers model retraining using verified feedback for a specific user.
+    """
+    result = model.retrain_model_with_feedback(request.user_id)
+    if result["success"]:
         # Reload model and scaler globally for future predictions
         model.ml_model = tf.keras.models.load_model(model.MODEL_PATH)
         model.scaler = joblib.load(SCALER_PATH)
-        return {"message": f"Model retrained using feedback for user {request.user_id}."}
+        return {"message": result["message"]}
     else:
-        raise HTTPException(status_code=404, detail="No feedback found for retraining.")
+        raise HTTPException(status_code=400, detail=result["message"])
